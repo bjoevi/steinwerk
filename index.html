@@ -23,6 +23,7 @@ a{color:inherit}
 .brand{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .brand h1{font-size:clamp(28px,4vw,40px);font-weight:900;letter-spacing:-.02em}
 .brand p{margin:0;font-size:15px;opacity:.8}
+.syncb{font-size:13px;font-weight:600;background:rgba(0,0,0,.08);padding:4px 10px;border-radius:999px}.syncb:empty{display:none}.syncb.err{background:var(--r);color:#fff}
 .studs{display:inline-grid;grid-template-columns:repeat(4,12px);gap:4px;background:var(--r);padding:6px;border-radius:5px}
 .studs i{width:12px;height:12px;border-radius:50%;background:#ef4a4f;box-shadow:inset 0 -2px 0 #9e1a1f}
 nav{display:flex;gap:4px;margin-top:14px;overflow-x:auto}
@@ -123,7 +124,7 @@ small.note{color:var(--mute);font-size:13px}
 </style></head><body>
 <header class="top">
   <div class="brand"><span class="studs" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-    <div><h1>Steinwerk</h1><p>Sets erfassen, Teile abhaken, Anleitungen finden – und alles wieder aufbauen.</p></div></div>
+    <div style="flex:1"><h1>Steinwerk</h1><p>Sets erfassen, Teile abhaken, Anleitungen finden – und alles wieder aufbauen.</p></div><span id="sync" class="syncb"></span></div>
   <nav id="nav">
     <button data-view="sets">Meine Sets</button><button data-view="photo">Foto erkennen</button><button data-view="search">Teilesuche</button>
     <button data-view="missing">Fehlteile</button><button data-view="settings">Einstellungen</button>
@@ -136,7 +137,7 @@ small.note{color:var(--mute);font-size:13px}
 <script>
 {
 const RB='https://rebrickable.com/api/v3/lego';
-const S={key:'',sets:{},themes:{}};
+const S={key:'',sets:{},themes:{},tomb:{},gh:'',gist:'',lastSync:0};
 let db=null,view='sets',cur=null,busyMsg='',filt={q:'',st:'',sort:'near'},pf={q:'',miss:false,spare:false,sort:'color'},sq='',mscope='open',searchRes=[];
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -152,7 +153,7 @@ function putMeta(k,v){if(db)db.transaction('meta','readwrite').objectStore('meta
 function putSet(s){if(db)db.transaction('sets','readwrite').objectStore('sets').put(s)}
 function delSet(n){if(db)db.transaction('sets','readwrite').objectStore('sets').delete(n)}
 const dirty=new Set();let svT;
-function save(s){dirty.add(s.set_num);clearTimeout(svT);svT=setTimeout(flush,350)}
+function save(s){s.u=Date.now();dirty.add(s.set_num);clearTimeout(svT);svT=setTimeout(flush,350);schedSync()}
 function flush(){for(const n of dirty)if(S.sets[n])putSet(S.sets[n]);dirty.clear()}
 addEventListener('pagehide',flush);
 
@@ -192,6 +193,56 @@ async function fetchSet(num){
   return{set_num:s.set_num,name:s.name,year:s.year,num_parts:s.num_parts,img:s.set_img_url||'',url:s.set_url||'',theme:theme||'',parts:[...m.values()]};
 }
 
+/* ---------- Abgleich über privaten GitHub-Gist ---------- */
+const GF='steinwerk-sync.json';let syncing=false,syncAgain=false,syncT,syncMsg='',syncErr='';
+function schedSync(){if(!S.gh)return;clearTimeout(syncT);syncT=setTimeout(()=>sync(),3000)}
+function syncBadge(){const b=$('#sync');if(!b)return;b.textContent=!S.gh?'':syncing?'Abgleich …':syncErr?'Abgleich fehlgeschlagen':S.lastSync?'Abgeglichen '+new Date(S.lastSync).toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'}):'';b.className='syncb'+(syncErr?' err':'')}
+async function gh(path,opt={}){
+  let r;try{r=await fetch('https://api.github.com'+path,{...opt,cache:'no-store',headers:{Authorization:'Bearer '+S.gh,Accept:'application/vnd.github+json',...(opt.body?{'Content-Type':'application/json'}:{})}})}catch(_){throw new Error('GitHub nicht erreichbar – offline?')}
+  if(r.status===401)throw new Error('GitHub-Zugangsschlüssel ungültig oder abgelaufen');
+  if(r.status===403||r.status===404)throw new Error('GitHub verweigert den Zugriff – hat der Schlüssel das Recht „gist“?');
+  if(!r.ok)throw new Error('GitHub-Fehler '+r.status);return r.json()}
+async function readRemote(retry){
+  if(!S.gist){const l=await gh('/gists?per_page=100');const g=l.find(x=>x.files&&x.files[GF]);if(g){S.gist=g.id;putMeta('gist',g.id)}}
+  if(!S.gist){const g=await gh('/gists',{method:'POST',body:JSON.stringify({description:'Steinwerk Sync (nicht löschen)',public:false,files:{[GF]:{content:JSON.stringify({v:1,sets:{}})}}})});S.gist=g.id;putMeta('gist',g.id);return{v:1,sets:{}}}
+  let g;try{g=await gh('/gists/'+S.gist)}catch(e){if(/verweigert/.test(e.message)&&!retry){S.gist='';putMeta('gist','');return readRemote(true)}throw e}
+  const f=g.files[GF];if(!f)return{v:1,sets:{}};
+  let txt=f.content;if(f.truncated){const r=await fetch(f.raw_url,{cache:'no-store'});txt=await r.text()}
+  try{const d=JSON.parse(txt);d.sets=d.sets||{};return d}catch(_){return{v:1,sets:{}}}}
+const pick=s=>({u:s.u||s.added||1,name:s.name,status:s.status,manual:s.manual,note:s.note,link:s.link,added:s.added,have:s.have});
+async function sync(first){
+  if(!S.gh)return;if(syncing){syncAgain=true;return}
+  syncing=true;syncErr='';syncBadge();let changed=false;
+  try{
+    flush();const R=await readRemote();let dirtyR=false;const toFetch=[];
+    const keyU=(await getMeta('keyU'))||0;
+    if(R.rb&&R.rb.u>keyU&&R.rb.key!==S.key){S.key=R.rb.key;putMeta('key',S.key);putMeta('keyU',R.rb.u);changed=true}
+    else if(S.key&&(!R.rb||keyU>R.rb.u)){R.rb={key:S.key,u:keyU||Date.now()};dirtyR=true}
+    const nums=new Set([...Object.keys(R.sets),...Object.keys(S.sets),...Object.keys(S.tomb)]);
+    for(const n of nums){
+      const r=R.sets[n],l=S.sets[n],lu=l?(l.u||l.added||1):(S.tomb[n]||0),ru=r?r.u:0;
+      if(ru>lu){
+        if(r.del){if(l){delete S.sets[n];delSet(n);changed=true}S.tomb[n]=ru}
+        else if(l){Object.assign(l,{status:r.status,manual:r.manual,note:r.note||'',link:r.link||'',have:r.have||{},u:r.u});putSet(l);changed=true}
+        else toFetch.push(n)}
+      else if(lu>ru){R.sets[n]=l?pick(l):{del:true,u:lu};dirtyR=true}
+    }
+    putMeta('tomb',S.tomb);
+    if(dirtyR){R.v=1;R.updated=Date.now();await gh('/gists/'+S.gist,{method:'PATCH',body:JSON.stringify({files:{[GF]:{content:JSON.stringify(R)}}})})}
+    if(changed)rerender();
+    if(toFetch.length&&S.key){let i=0;for(const n of toFetch){i++;syncMsg=`Lade Set ${i} von ${toFetch.length} von den anderen Geräten …`;setBusy(syncMsg);const r=R.sets[n];
+        try{const d=await fetchSet(n);const s={...d,status:r.status||'offen',manual:r.manual!==false,note:r.note||'',link:r.link||'',have:r.have||{},added:r.added||Date.now(),u:r.u};if(!S.sets[n]||S.sets[n].u<r.u){S.sets[n]=s;putSet(s);rerender()}}catch(e){toast(n+': '+e.message,true)}}
+      syncMsg='';setBusy('')}
+    S.lastSync=Date.now();putMeta('lastSync',S.lastSync);
+    if(first&&toFetch.length)toast(toFetch.length+' Sets von deinen anderen Geräten übernommen');
+  }catch(e){syncErr=e.message;if(first||view==='settings')toast('Abgleich: '+e.message,true)}
+  syncing=false;syncBadge();if(view==='settings')rerender();
+  if(syncAgain){syncAgain=false;schedSync()}
+}
+function rerender(){const a=document.activeElement;if(a&&/INPUT|TEXTAREA|SELECT/.test(a.tagName)&&a.closest('#app'))return;render()}
+addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')sync();else flush()});
+setInterval(()=>{if(document.visibilityState==='visible')sync()},60000);
+
 /* ---------- Logik ---------- */
 function prog(s){let n=0,h=0;for(const p of s.parts){if(p.spare)continue;n+=p.qty;h+=Math.min(s.have[p.k]||0,p.qty)}return{n,h,pct:n?Math.floor(h/n*100):0}}
 const base=n=>n.replace(/-\d+$/,'');
@@ -203,7 +254,7 @@ async function addSets(list){
     const num=norm(raw);if(!num)continue;
     if(S.sets[num]){toast(num+' ist schon erfasst');continue}
     setBusy(`Lade ${num} …`);
-    try{const d=await fetchSet(num);const s={...d,status:'offen',manual:true,note:'',link:'',have:{},added:Date.now()};S.sets[s.set_num]=s;putSet(s);toast(`${s.set_num} „${s.name}“ erfasst – ${s.parts.length} Teilepositionen`)}
+    try{const d=await fetchSet(num);const s={...d,status:'offen',manual:true,note:'',link:'',have:{},added:Date.now(),u:Date.now()};S.sets[s.set_num]=s;putSet(s);delete S.tomb[s.set_num];putMeta('tomb',S.tomb);schedSync();toast(`${s.set_num} „${s.name}“ erfasst – ${s.parts.length} Teilepositionen`)}
     catch(e){toast(num+': '+e.message,true)}
     if(view==='sets')render();
   }
@@ -354,9 +405,14 @@ function vSettings(){
   return`<div class="panel"><h2>Rebrickable-API-Schlüssel</h2>
    <p class="sub" style="margin-top:0">Kostenlos: Konto bei <a href="https://rebrickable.com/signup/" target="_blank" rel="noopener">rebrickable.com</a> anlegen, dann unter <a href="https://rebrickable.com/api/" target="_blank" rel="noopener">rebrickable.com/api</a> „Generate new API key“. Der Schlüssel bleibt nur in diesem Browser.</p>
    <div class="bar"><input class="grow" id="key" value="${esc(S.key)}" placeholder="API-Schlüssel einfügen" autocomplete="off"><button class="btn y" data-act="savekey">Speichern & testen</button></div></div>
+  <div class="panel"><h2>Geräte abgleichen</h2>
+   <p class="sub" style="margin-top:0">Hält deine Sammlung auf PC, Handy und Tablet automatisch gleich – über eine private Datei (Gist) in deinem GitHub-Konto. Auf jedem Gerät einmal denselben Zugangsschlüssel eintragen; der Rebrickable-Schlüssel wird dann mit übertragen.</p>
+   <ol class="steps sub"><li><a href="https://github.com/settings/tokens/new?scopes=gist&description=Steinwerk" target="_blank" rel="noopener">Hier bei GitHub einen Schlüssel erzeugen</a> – Häkchen „gist“ ist schon gesetzt, bei „Expiration“ am besten „No expiration“ wählen, dann „Generate token“.</li><li>Den angezeigten Schlüssel (beginnt mit „ghp_“) kopieren und hier einfügen.</li></ol>
+   <div class="bar"><input class="grow" id="ghk" type="password" value="${esc(S.gh)}" placeholder="GitHub-Zugangsschlüssel (ghp_…)" autocomplete="off"><button class="btn y" data-act="ghsave">${S.gh?'Speichern':'Verbinden'}</button>${S.gh?'<button class="btn ghost" data-act="ghsync">Jetzt abgleichen</button><button class="btn ghost" data-act="ghoff">Trennen</button>':''}</div>
+   <p class="sub" style="margin:0">${S.gh?(syncing?'Abgleich läuft …':syncErr?'<span style="color:var(--r)">'+esc(syncErr)+'</span>':S.lastSync?'Zuletzt abgeglichen: '+new Date(S.lastSync).toLocaleString('de-DE'):'Noch nicht abgeglichen.'):'Nicht verbunden – Daten bleiben nur auf diesem Gerät.'}</p></div>
   <div class="panel"><h2>Sicherung</h2><p class="sub" style="margin-top:0">Alle Daten liegen lokal in diesem Browser (${n} Sets). Regelmäßig sichern – z. B. in deinen OneDrive-Ordner – dann kannst du auch auf einem anderen Rechner weitermachen.</p>
    <div class="bar"><button class="btn" data-act="exp" ${n?'':'disabled'}>Sicherung herunterladen</button><button class="btn ghost" data-act="imp">Sicherung einspielen</button></div></div>
-  <div class="panel"><h2>Handy & Teilen</h2><p class="sub" style="margin:0">Auf dem Handy: Seite öffnen → iPhone „Teilen → Zum Home-Bildschirm“, Android „⋮ → App installieren“. Jedes Gerät und jede Person hat eine eigene Sammlung und braucht einen eigenen (kostenlosen) Rebrickable-Schlüssel. Sammlung vom PC aufs Handy übertragen: hier „Sicherung herunterladen“, Datei z. B. über OneDrive aufs Handy holen und dort „Sicherung einspielen“.</p></div>
+  <div class="panel"><h2>Handy & Teilen</h2><p class="sub" style="margin:0">Auf dem Handy: Seite öffnen → iPhone „Teilen → Zum Home-Bildschirm“, Android „⋮ → App installieren“. Deine eigenen Geräte gleichst du oben unter „Geräte abgleichen“ ab. Wer den Link von dir bekommt, hat eine eigene, getrennte Sammlung und braucht eigene (kostenlose) Schlüssel.</p></div>
   <div class="panel"><h2>Woher die Daten kommen</h2><p class="sub" style="margin:0">Setdaten, Teilelisten, Farben und Bilder: Rebrickable-API. Anleitungen: Links zu LEGO (Bauanleitungen als PDF), Brickset und Rebrickable – dort sind auch ältere Sets meist zu finden. Für ganz alte Sets ohne PDF hilft das Feld „Eigener Link“.</p></div>`;
 }
 
@@ -388,7 +444,7 @@ document.addEventListener('click',async e=>{
   if(['dec','inc','full'].includes(a)&&s){const tr=t.closest('tr'),k=tr.dataset.k,x=s.parts.find(p=>p.k===k),h=s.have[k]||0;setHave(k,a==='dec'?h-1:a==='inc'?h+1:x.qty,tr);return}
   if(a==='allhave'&&s){for(const x of s.parts)s.have[x.k]=x.qty;save(s);render();updProg();return}
   if(a==='reset'&&s){if(delArm!==2){delArm=2;t.textContent='Wirklich alles auf 0?';setTimeout(()=>{delArm=0;if(t.isConnected)t.textContent='Zurücksetzen'},4000);return}delArm=0;s.have={};s.status='offen';save(s);render();return}
-  if(a==='del'&&s){if(delArm!==1){delArm=1;t.textContent='Wirklich löschen?';t.classList.add('red');setTimeout(()=>{delArm=0;if(t.isConnected){t.textContent='Set löschen';t.classList.remove('red')}},4000);return}delArm=0;delete S.sets[cur];delSet(cur);view='sets';render();toast('Set gelöscht');return}
+  if(a==='del'&&s){if(delArm!==1){delArm=1;t.textContent='Wirklich löschen?';t.classList.add('red');setTimeout(()=>{delArm=0;if(t.isConnected){t.textContent='Set löschen';t.classList.remove('red')}},4000);return}delArm=0;delete S.sets[cur];delSet(cur);S.tomb[cur]=Date.now();putMeta('tomb',S.tomb);schedSync();view='sets';render();toast('Set gelöscht');return}
   if(a==='reload'&&s){t.disabled=true;t.textContent='Lade …';try{const d=await fetchSet(s.set_num);Object.assign(s,d);save(s);render();toast('Katalogdaten aktualisiert – deine Zählung bleibt erhalten')}catch(err){toast(err.message,true);t.disabled=false;t.textContent='Katalogdaten neu laden'}return}
   if(a==='missof'&&s){mscope=s.set_num;view='missing';render();scrollTo(0,0);return}
   if(a==='plus1'){const o=S.sets[t.dataset.n];const x=o&&o.parts.find(p=>p.k===t.dataset.k);if(!x)return;o.have[x.k]=Math.min(x.qty,(o.have[x.k]||0)+1);if(prog(o).h>0&&o.status==='offen')o.status='arbeit';save(o);toast(`+1 in ${o.set_num} „${o.name}“`);if(view!=='search'){render();return}$('#sres').outerHTML=new DOMParser().parseFromString(vSearch(),'text/html').querySelector('#sres').outerHTML;return}
@@ -396,7 +452,10 @@ document.addEventListener('click',async e=>{
     if(a==='xbl'){dl(`fehlteile-${tag}.xml`,'<INVENTORY>\n'+it.map(i=>`<ITEM><ITEMTYPE>P</ITEMTYPE><ITEMID>${esc(i.blp||i.pn)}</ITEMID>${i.blc!=null?`<COLOR>${i.blc}</COLOR>`:''}<MINQTY>${i.miss}</MINQTY></ITEM>`).join('\n')+'\n</INVENTORY>\n','application/xml');toast('XML gespeichert – bei BrickLink unter „Wanted → Upload“ einfügen')}
     else if(a==='xrb'){dl(`fehlteile-${tag}.csv`,'Part,Color,Quantity\n'+it.map(i=>`${i.pn},${i.cid},${i.miss}`).join('\n')+'\n','text/csv');toast('CSV gespeichert – bei Rebrickable als Teileliste importierbar')}
     else{const txt=it.map(i=>`${i.miss}× ${i.pn} ${i.name} (${i.cname})`).join('\n');try{await navigator.clipboard.writeText(txt);toast('Liste kopiert')}catch(_){toast('Kopieren nicht erlaubt – bitte Export nutzen',true)}}return}
-  if(a==='savekey'){S.key=$('#key').value.trim();putMeta('key',S.key);if(!S.key){toast('Schlüssel entfernt');return}t.disabled=true;try{await api('/colors/?page_size=1');toast('Schlüssel funktioniert – leg los!')}catch(err){toast(err.message,true)}t.disabled=false;return}
+  if(a==='ghsave'){S.gh=$('#ghk').value.trim();putMeta('gh',S.gh);S.gist='';putMeta('gist','');if(S.gh){toast('Verbinde mit GitHub …');await sync(true);if(!syncErr)toast('Verbunden – Abgleich aktiv')}render();return}
+  if(a==='ghsync'){await sync(true);if(!syncErr)toast('Abgeglichen');return}
+  if(a==='ghoff'){S.gh='';putMeta('gh','');S.gist='';putMeta('gist','');syncErr='';syncBadge();render();toast('Abgleich getrennt – Daten bleiben auf diesem Gerät');return}
+  if(a==='savekey'){S.key=$('#key').value.trim();putMeta('key',S.key);putMeta('keyU',Date.now());schedSync();if(!S.key){toast('Schlüssel entfernt');return}t.disabled=true;try{await api('/colors/?page_size=1');toast('Schlüssel funktioniert – leg los!')}catch(err){toast(err.message,true)}t.disabled=false;return}
   if(a==='exp'){flush();dl(`steinwerk-sicherung-${new Date().toISOString().slice(0,10)}.json`,JSON.stringify({app:'steinwerk',v:1,sets:Object.values(S.sets)}),'application/json');return}
   if(a==='imp'){$('#imp').click();return}
 });
@@ -417,10 +476,10 @@ document.addEventListener('dragover',e=>{const d=e.target.closest&&e.target.clos
 document.addEventListener('dragleave',e=>{const d=e.target.closest&&e.target.closest('#drop');if(d)d.classList.remove('over')});
 document.addEventListener('drop',e=>{const d=e.target.closest&&e.target.closest('#drop');if(!d)return;e.preventDefault();d.classList.remove('over');recognize(e.dataTransfer.files)});
 document.addEventListener('paste',e=>{if(view!=='photo')return;const f=[...(e.clipboardData?.files||[])];if(f.length)recognize(f)});
-$('#imp').addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;try{const d=JSON.parse(await f.text());if(!Array.isArray(d.sets))throw 0;let c=0;for(const s of d.sets){if(!s.set_num||!Array.isArray(s.parts))continue;s.have=s.have||{};S.sets[s.set_num]=s;putSet(s);c++}toast(c+' Sets eingespielt');render()}catch(_){toast('Datei ist keine gültige Steinwerk-Sicherung',true)}e.target.value=''});
+$('#imp').addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;try{const d=JSON.parse(await f.text());if(!Array.isArray(d.sets))throw 0;let c=0;for(const s of d.sets){if(!s.set_num||!Array.isArray(s.parts))continue;s.have=s.have||{};s.u=Date.now();S.sets[s.set_num]=s;putSet(s);c++}schedSync();toast(c+' Sets eingespielt');render()}catch(_){toast('Datei ist keine gültige Steinwerk-Sicherung',true)}e.target.value=''});
 
 /* ---------- Start ---------- */
-(async()=>{db=await openDB();S.key=(await getMeta('key'))||'';S.themes=(await getMeta('themes'))||{};for(const s of await getAll())S.sets[s.set_num]=s;
-  if(!db)toast('Browser-Speicher nicht verfügbar – Daten gehen beim Schließen verloren. Bitte Sicherung nutzen.',true);render()})();
+(async()=>{db=await openDB();S.key=(await getMeta('key'))||'';S.themes=(await getMeta('themes'))||{};S.tomb=(await getMeta('tomb'))||{};S.gh=(await getMeta('gh'))||'';S.gist=(await getMeta('gist'))||'';S.lastSync=(await getMeta('lastSync'))||0;for(const s of await getAll())S.sets[s.set_num]=s;
+  if(!db)toast('Browser-Speicher nicht verfügbar – Daten gehen beim Schließen verloren. Bitte Sicherung nutzen.',true);render();if(S.gh)sync(true)})();
 }
 </script></body></html>
